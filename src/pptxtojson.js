@@ -15,341 +15,25 @@ import { findOMath, latexFormart, parseOMath } from './math'
 import { getShapePath } from './shapePath'
 
 export async function parse(file) {
-  const slides = []
-  
-  const zip = await JSZip.loadAsync(file)
+  const pptx = await PPTX.load(file)
 
-  const filesInfo = await getContentTypes(zip)
-  const { width, height, defaultTextStyle } = await getSlideInfo(zip)
-  const { themeContent, themeColors } = await getTheme(zip)
+  const slides = await pptx.getSlides()
+  const layouts = await pptx.getLayouts()
 
-  for (const filename of filesInfo.slides) {
-    const singleSlide = await processSingleSlide(zip, filename, themeContent, defaultTextStyle)
-    slides.push(singleSlide)
-  }
+
+  const { width, height, } = await pptx.getSlideInfo()
+  const {themeColors } = await pptx.getTheme()
+
 
   return {
     slides,
+    layouts,
     themeColors,
     size: {
       width,
       height,
     },
   }
-}
-
-async function getContentTypes(zip) {
-  const ContentTypesJson = await readXmlFile(zip, '[Content_Types].xml')
-  const subObj = ContentTypesJson['Types']['Override']
-  let slidesLocArray = []
-  let slideLayoutsLocArray = []
-
-  for (const item of subObj) {
-    switch (item['attrs']['ContentType']) {
-      case 'application/vnd.openxmlformats-officedocument.presentationml.slide+xml':
-        slidesLocArray.push(item['attrs']['PartName'].substr(1))
-        break
-      case 'application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml':
-        slideLayoutsLocArray.push(item['attrs']['PartName'].substr(1))
-        break
-      default:
-    }
-  }
-  
-  const sortSlideXml = (p1, p2) => {
-    const n1 = +/(\d+)\.xml/.exec(p1)[1]
-    const n2 = +/(\d+)\.xml/.exec(p2)[1]
-    return n1 - n2
-  }
-  slidesLocArray = slidesLocArray.sort(sortSlideXml)
-  slideLayoutsLocArray = slideLayoutsLocArray.sort(sortSlideXml)
-  
-  return {
-    slides: slidesLocArray,
-    slideLayouts: slideLayoutsLocArray,
-  }
-}
-
-async function getSlideInfo(zip) {
-  const content = await readXmlFile(zip, 'ppt/presentation.xml')
-  const sldSzAttrs = content['p:presentation']['p:sldSz']['attrs']
-  const defaultTextStyle = content['p:presentation']['p:defaultTextStyle']
-  return {
-    width: parseInt(sldSzAttrs['cx']) * RATIO_EMUs_Points,
-    height: parseInt(sldSzAttrs['cy']) * RATIO_EMUs_Points,
-    defaultTextStyle,
-  }
-}
-
-async function getTheme(zip) {
-  const preResContent = await readXmlFile(zip, 'ppt/_rels/presentation.xml.rels')
-  const relationshipArray = preResContent['Relationships']['Relationship']
-  let themeURI
-
-  if (relationshipArray.constructor === Array) {
-    for (const relationshipItem of relationshipArray) {
-      if (relationshipItem['attrs']['Type'] === 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme') {
-        themeURI = relationshipItem['attrs']['Target']
-        break
-      }
-    }
-  } 
-  else if (relationshipArray['attrs']['Type'] === 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme') {
-    themeURI = relationshipArray['attrs']['Target']
-  }
-
-  const themeContent = await readXmlFile(zip, 'ppt/' + themeURI)
-
-  const themeColors = []
-  const clrScheme = getTextByPathList(themeContent, ['a:theme', 'a:themeElements', 'a:clrScheme'])
-  if (clrScheme) {
-    for (let i = 1; i <= 6; i++) {
-      if (clrScheme[`a:accent${i}`] === undefined) break
-      const color = getTextByPathList(clrScheme, [`a:accent${i}`, 'a:srgbClr', 'attrs', 'val'])
-      if (color) themeColors.push('#' + color)
-    }
-  }
-
-  return { themeContent, themeColors }
-}
-
-async function processSingleSlide(zip, sldFileName, themeContent, defaultTextStyle) {
-  const resName = sldFileName.replace('slides/slide', 'slides/_rels/slide') + '.rels'
-  const resContent = await readXmlFile(zip, resName)
-  let relationshipArray = resContent['Relationships']['Relationship']
-  if (relationshipArray.constructor !== Array) relationshipArray = [relationshipArray]
-  
-  let noteFilename = ''
-  let layoutFilename = ''
-  let masterFilename = ''
-  let themeFilename = ''
-  let diagramFilename = ''
-  const slideResObj = {}
-  const layoutResObj = {}
-  const masterResObj = {}
-  const themeResObj = {}
-  const diagramResObj = {}
-
-  for (const relationshipArrayItem of relationshipArray) {
-    switch (relationshipArrayItem['attrs']['Type']) {
-      case 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout':
-        layoutFilename = relationshipArrayItem['attrs']['Target'].replace('../', 'ppt/')
-        break
-      case 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide':
-        noteFilename = relationshipArrayItem['attrs']['Target'].replace('../', 'ppt/')
-        break
-      case 'http://schemas.microsoft.com/office/2007/relationships/diagramDrawing':
-        diagramFilename = relationshipArrayItem['attrs']['Target'].replace('../', 'ppt/')
-        slideResObj[relationshipArrayItem['attrs']['Id']] = {
-          type: relationshipArrayItem['attrs']['Type'].replace('http://schemas.openxmlformats.org/officeDocument/2006/relationships/', ''),
-          target: relationshipArrayItem['attrs']['Target'].replace('../', 'ppt/')
-        }
-        break
-      case 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/image':
-      case 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart':
-      case 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink':
-      default:
-        slideResObj[relationshipArrayItem['attrs']['Id']] = {
-          type: relationshipArrayItem['attrs']['Type'].replace('http://schemas.openxmlformats.org/officeDocument/2006/relationships/', ''),
-          target: relationshipArrayItem['attrs']['Target'].replace('../', 'ppt/'),
-        }
-    }
-  }
-  
-  const slideNotesContent = await readXmlFile(zip, noteFilename)
-  const note = getNote(slideNotesContent)
-
-  const slideLayoutContent = await readXmlFile(zip, layoutFilename)
-  const slideLayoutTables = await indexNodes(slideLayoutContent)
-  const slideLayoutResFilename = layoutFilename.replace('slideLayouts/slideLayout', 'slideLayouts/_rels/slideLayout') + '.rels'
-  const slideLayoutResContent = await readXmlFile(zip, slideLayoutResFilename)
-  relationshipArray = slideLayoutResContent['Relationships']['Relationship']
-  if (relationshipArray.constructor !== Array) relationshipArray = [relationshipArray]
-
-  for (const relationshipArrayItem of relationshipArray) {
-    switch (relationshipArrayItem['attrs']['Type']) {
-      case 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster':
-        masterFilename = relationshipArrayItem['attrs']['Target'].replace('../', 'ppt/')
-        break
-      default:
-        layoutResObj[relationshipArrayItem['attrs']['Id']] = {
-          type: relationshipArrayItem['attrs']['Type'].replace('http://schemas.openxmlformats.org/officeDocument/2006/relationships/', ''),
-          target: relationshipArrayItem['attrs']['Target'].replace('../', 'ppt/'),
-        }
-    }
-  }
-
-  const slideMasterContent = await readXmlFile(zip, masterFilename)
-  const slideMasterTextStyles = getTextByPathList(slideMasterContent, ['p:sldMaster', 'p:txStyles'])
-  const slideMasterTables = indexNodes(slideMasterContent)
-  const slideMasterResFilename = masterFilename.replace('slideMasters/slideMaster', 'slideMasters/_rels/slideMaster') + '.rels'
-  const slideMasterResContent = await readXmlFile(zip, slideMasterResFilename)
-  relationshipArray = slideMasterResContent['Relationships']['Relationship']
-  if (relationshipArray.constructor !== Array) relationshipArray = [relationshipArray]
-
-  for (const relationshipArrayItem of relationshipArray) {
-    switch (relationshipArrayItem['attrs']['Type']) {
-      case 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme':
-        themeFilename = relationshipArrayItem['attrs']['Target'].replace('../', 'ppt/')
-        break
-      default:
-        masterResObj[relationshipArrayItem['attrs']['Id']] = {
-          type: relationshipArrayItem['attrs']['Type'].replace('http://schemas.openxmlformats.org/officeDocument/2006/relationships/', ''),
-          target: relationshipArrayItem['attrs']['Target'].replace('../', 'ppt/'),
-        }
-    }
-  }
-
-  if (themeFilename) {
-    const themeName = themeFilename.split('/').pop()
-    const themeResFileName = themeFilename.replace(themeName, '_rels/' + themeName) + '.rels'
-    const themeResContent = await readXmlFile(zip, themeResFileName)
-    if (themeResContent) {
-      relationshipArray = themeResContent['Relationships']['Relationship']
-      if (relationshipArray) {
-        if (relationshipArray.constructor !== Array) relationshipArray = [relationshipArray]
-        for (const relationshipArrayItem of relationshipArray) {
-          themeResObj[relationshipArrayItem['attrs']['Id']] = {
-            'type': relationshipArrayItem['attrs']['Type'].replace('http://schemas.openxmlformats.org/officeDocument/2006/relationships/', ''),
-            'target': relationshipArrayItem['attrs']['Target'].replace('../', 'ppt/')
-          }
-        }
-      }
-    }
-  }
-
-  let digramFileContent = {}
-  if (diagramFilename) {
-    const diagName = diagramFilename.split('/').pop()
-    const diagramResFileName = diagramFilename.replace(diagName, '_rels/' + diagName) + '.rels'
-    digramFileContent = await readXmlFile(zip, diagramFilename)
-    if (digramFileContent) {
-      const digramFileContentObjToStr = JSON.stringify(digramFileContent).replace(/dsp:/g, 'p:')
-      digramFileContent = JSON.parse(digramFileContentObjToStr)
-    }
-    const digramResContent = await readXmlFile(zip, diagramResFileName)
-    if (digramResContent) {
-      relationshipArray = digramResContent['Relationships']['Relationship']
-      if (relationshipArray.constructor !== Array) relationshipArray = [relationshipArray]
-      for (const relationshipArrayItem of relationshipArray) {
-        diagramResObj[relationshipArrayItem['attrs']['Id']] = {
-          'type': relationshipArrayItem['attrs']['Type'].replace('http://schemas.openxmlformats.org/officeDocument/2006/relationships/', ''),
-          'target': relationshipArrayItem['attrs']['Target'].replace('../', 'ppt/')
-        }
-      }
-    }
-  }
-
-  const tableStyles = await readXmlFile(zip, 'ppt/tableStyles.xml')
-
-  const slideContent = await readXmlFile(zip, sldFileName)
-  const nodes = slideContent['p:sld']['p:cSld']['p:spTree']
-  const warpObj = {
-    zip,
-    slideLayoutContent,
-    slideLayoutTables,
-    slideMasterContent,
-    slideMasterTables,
-    slideContent,
-    tableStyles,
-    slideResObj,
-    slideMasterTextStyles,
-    layoutResObj,
-    masterResObj,
-    themeContent,
-    themeResObj,
-    digramFileContent,
-    diagramResObj,
-    defaultTextStyle,
-  }
-  const layoutElements = await getLayoutElements(warpObj)
-  const fill = await getSlideBackgroundFill(warpObj)
-
-  const elements = []
-  for (const nodeKey in nodes) {
-    if (nodes[nodeKey].constructor !== Array) nodes[nodeKey] = [nodes[nodeKey]]
-    for (const node of nodes[nodeKey]) {
-      const ret = await processNodesInSlide(nodeKey, node, nodes, warpObj, 'slide')
-      if (ret) elements.push(ret)
-    }
-  }
-
-  return {
-    fill,
-    elements,
-    layoutElements,
-    note,
-  }
-}
-
-function getNote(noteContent) {
-  let text = ''
-  let spNodes = getTextByPathList(noteContent, ['p:notes', 'p:cSld', 'p:spTree', 'p:sp'])
-  if (!spNodes) return ''
-
-  if (spNodes.constructor !== Array) spNodes = [spNodes]
-  for (const spNode of spNodes) {
-    let rNodes = getTextByPathList(spNode, ['p:txBody', 'a:p', 'a:r'])
-    if (!rNodes) continue
-
-    if (rNodes.constructor !== Array) rNodes = [rNodes]
-    for (const rNode of rNodes) {
-      const t = getTextByPathList(rNode, ['a:t'])
-      if (t && typeof t === 'string') text += t
-    }
-  }
-  return text
-}
-
-async function getLayoutElements(warpObj) {
-  const elements = []
-  const slideLayoutContent = warpObj['slideLayoutContent']
-  const slideMasterContent = warpObj['slideMasterContent']
-  const nodesSldLayout = getTextByPathList(slideLayoutContent, ['p:sldLayout', 'p:cSld', 'p:spTree'])
-  const nodesSldMaster = getTextByPathList(slideMasterContent, ['p:sldMaster', 'p:cSld', 'p:spTree'])
-
-  const showMasterSp = getTextByPathList(slideLayoutContent, ['p:sldLayout', 'attrs', 'showMasterSp'])
-  if (nodesSldLayout) {
-    for (const nodeKey in nodesSldLayout) {
-      if (nodesSldLayout[nodeKey].constructor === Array) {
-        for (let i = 0; i < nodesSldLayout[nodeKey].length; i++) {
-          const ph = getTextByPathList(nodesSldLayout[nodeKey][i], ['p:nvSpPr', 'p:nvPr', 'p:ph'])
-          if (!ph) {
-            const ret = await processNodesInSlide(nodeKey, nodesSldLayout[nodeKey][i], nodesSldLayout, warpObj, 'slideLayoutBg')
-            if (ret) elements.push(ret)
-          }
-        }
-      } 
-      else {
-        const ph = getTextByPathList(nodesSldLayout[nodeKey], ['p:nvSpPr', 'p:nvPr', 'p:ph'])
-        if (!ph) {
-          const ret = await processNodesInSlide(nodeKey, nodesSldLayout[nodeKey], nodesSldLayout, warpObj, 'slideLayoutBg')
-          if (ret) elements.push(ret)
-        }
-      }
-    }
-  }
-  if (nodesSldMaster && showMasterSp !== '0') {
-    for (const nodeKey in nodesSldMaster) {
-      if (nodesSldMaster[nodeKey].constructor === Array) {
-        for (let i = 0; i < nodesSldMaster[nodeKey].length; i++) {
-          const ph = getTextByPathList(nodesSldMaster[nodeKey][i], ['p:nvSpPr', 'p:nvPr', 'p:ph'])
-          if (!ph) {
-            const ret = await processNodesInSlide(nodeKey, nodesSldMaster[nodeKey][i], nodesSldMaster, warpObj, 'slideMasterBg')
-            if (ret) elements.push(ret)
-          }
-        }
-      } 
-      else {
-        const ph = getTextByPathList(nodesSldMaster[nodeKey], ['p:nvSpPr', 'p:nvPr', 'p:ph'])
-        if (!ph) {
-          const ret = await processNodesInSlide(nodeKey, nodesSldMaster[nodeKey], nodesSldMaster, warpObj, 'slideMasterBg')
-          if (ret) elements.push(ret)
-        }
-      }
-    }
-  }
-  return elements
 }
 
 function indexNodes(content) {
@@ -670,7 +354,7 @@ async function processPicNode(node, warpObj, source) {
   let resObj
   if (source === 'slideMasterBg') resObj = warpObj['masterResObj']
   else if (source === 'slideLayoutBg') resObj = warpObj['layoutResObj']
-  else resObj = warpObj['slideResObj']
+  else resObj = warpObj['resObj']
 
   const order = node['attrs']['order']
   
@@ -1027,7 +711,7 @@ async function genChart(node, warpObj) {
   const { width, height } = getSize(xfrmNode, undefined, undefined)
 
   const rid = node['a:graphic']['a:graphicData']['c:chart']['attrs']['r:id']
-  let refName = getTextByPathList(warpObj['slideResObj'], [rid, 'target'])
+  let refName = getTextByPathList(warpObj['resObj'], [rid, 'target'])
   if (!refName) refName = getTextByPathList(warpObj['layoutResObj'], [rid, 'target'])
   if (!refName) refName = getTextByPathList(warpObj['masterResObj'], [rid, 'target'])
   if (!refName) return {}
@@ -1082,5 +766,480 @@ async function genDiagram(node, warpObj) {
     height,
     elements,
     order,
+  }
+}
+
+
+class PPTX {
+  constructor(zip) {
+    this.zip = zip
+  }
+
+  static async load(pptxFile) {
+    const zip = await JSZip.loadAsync(pptxFile)
+    return new PPTX(zip)
+  }
+
+  async getContentTypes() {
+    if (!this._contentTypes) {
+      const contentTypesJson = await readXmlFile(this.zip, '[Content_Types].xml')
+      const subObj = contentTypesJson['Types']['Override']
+      let slidesLocArray = []
+      let slideLayoutsLocArray = []
+
+      for (const item of subObj) {
+        switch (item['attrs']['ContentType']) {
+          case 'application/vnd.openxmlformats-officedocument.presentationml.slide+xml':
+            slidesLocArray.push(item['attrs']['PartName'].substr(1))
+            break
+          case 'application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml':
+            slideLayoutsLocArray.push(item['attrs']['PartName'].substr(1))
+            break
+          default:
+        }
+      }
+
+      const sortSlideXml = (p1, p2) => {
+        const n1 = +/(\d+)\.xml/.exec(p1)[1]
+        const n2 = +/(\d+)\.xml/.exec(p2)[1]
+        return n1 - n2
+      }
+      slidesLocArray = slidesLocArray.sort(sortSlideXml)
+      slideLayoutsLocArray = slideLayoutsLocArray.sort(sortSlideXml)
+      this._contentTypes = {
+        slides: slidesLocArray,
+        slideLayouts: slideLayoutsLocArray,
+      }
+    }
+
+
+    return this._contentTypes
+  }
+
+  async getSlideInfo() {
+    if (!this._slideInfo) {
+      const content = await readXmlFile(this.zip, 'ppt/presentation.xml')
+      const sldSzAttrs = content['p:presentation']['p:sldSz']['attrs']
+      const defaultTextStyle = content['p:presentation']['p:defaultTextStyle']
+      this._slideInfo = {
+        width: parseInt(sldSzAttrs['cx']) * RATIO_EMUs_Points,
+        height: parseInt(sldSzAttrs['cy']) * RATIO_EMUs_Points,
+        defaultTextStyle,
+      }
+    }
+
+    return this._slideInfo
+  }
+
+  async getTheme() {
+    if (!this._theme) {
+      const preResContent = await this.readXml( 'ppt/_rels/presentation.xml.rels')
+      const relationshipArray = preResContent['Relationships']['Relationship']
+      let themeURI
+
+      if (relationshipArray.constructor === Array) {
+        for (const relationshipItem of relationshipArray) {
+          if (relationshipItem['attrs']['Type'] === 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme') {
+            themeURI = relationshipItem['attrs']['Target']
+            break
+          }
+        }
+      }
+      else if (relationshipArray['attrs']['Type'] === 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme') {
+        themeURI = relationshipArray['attrs']['Target']
+      }
+
+      const themeContent = await this.readXml( 'ppt/' + themeURI)
+
+      const themeColors = []
+      const clrScheme = getTextByPathList(themeContent, ['a:theme', 'a:themeElements', 'a:clrScheme'])
+      if (clrScheme) {
+        for (let i = 1; i <= 6; i++) {
+          if (clrScheme[`a:accent${i}`] === undefined) break
+          const color = getTextByPathList(clrScheme, [`a:accent${i}`, 'a:srgbClr', 'attrs', 'val'])
+          if (color) themeColors.push('#' + color)
+        }
+      }
+      this._theme = {themeContent, themeColors}
+    }
+
+
+    return this._theme
+  }
+
+  async getTableStyles() {
+    if (!this._tableStyles) {
+      this._tableStyles = await this.readXml('ppt/tableStyles.xml')
+    }
+
+    return this._tableStyles
+  }
+
+  async getSlides() {
+    if (!this._slides) {
+      this._slides = []
+      const filesInfo = await this.getContentTypes()
+
+      for (const fileName of filesInfo.slides) {
+        const slide = await this.processSlide(fileName)
+        this._slides.push(slide)
+      }
+    }
+
+    return this._slides
+  }
+
+  async getLayouts() {
+    if (!this._layouts) {
+      this._layouts = []
+      const filesInfo = await this.getContentTypes()
+      for (const fileName of filesInfo.slideLayouts) {
+        const layout = await this.processSlideLayout(fileName)
+        this._layouts.push(layout)
+      }
+    }
+
+    return this._layouts
+  }
+
+  async processSlide(sldFileName) {
+    const resName = sldFileName.replace('slides/slide', 'slides/_rels/slide') + '.rels'
+    const resContent = await this.readXml(resName)
+    let relationshipArray = resContent['Relationships']['Relationship']
+    if (relationshipArray.constructor !== Array) relationshipArray = [relationshipArray]
+
+    const relationships = await this.processRelationship(resName)
+
+    const noteFilename = relationships.noteFilename
+    const layoutFilename = relationships.layoutFilename
+
+
+    const diagramFilename = relationships.diagramFilename
+    const slideResObj = relationships.resObj
+
+
+
+    const diagramResObj = {}
+
+    const note = await this.processNote(noteFilename)
+
+    const slideLayout = await this.processSlideLayout(layoutFilename)
+
+    let digramFileContent = {}
+    if (diagramFilename) {
+      const diagName = diagramFilename.split('/').pop()
+      const diagramResFileName = diagramFilename.replace(diagName, '_rels/' + diagName) + '.rels'
+      digramFileContent = await this.readXml(diagramFilename)
+      if (digramFileContent) {
+        const digramFileContentObjToStr = JSON.stringify(digramFileContent).replace(/dsp:/g, 'p:')
+        digramFileContent = JSON.parse(digramFileContentObjToStr)
+      }
+      const digramResContent = await this.readXml(diagramResFileName)
+      if (digramResContent) {
+        relationshipArray = digramResContent['Relationships']['Relationship']
+        if (relationshipArray.constructor !== Array) relationshipArray = [relationshipArray]
+        for (const relationshipArrayItem of relationshipArray) {
+          diagramResObj[relationshipArrayItem['attrs']['Id']] = {
+            'type': relationshipArrayItem['attrs']['Type'].replace('http://schemas.openxmlformats.org/officeDocument/2006/relationships/', ''),
+            'target': relationshipArrayItem['attrs']['Target'].replace('../', 'ppt/')
+          }
+        }
+      }
+    }
+
+    const slideContent = await this.readXml(sldFileName)
+    const nodes = slideContent['p:sld']['p:cSld']['p:spTree']
+    const warpObj = slideLayout.warpObj
+
+    const layoutElements = slideLayout.elements
+
+    warpObj.slideContent = slideContent
+    warpObj.slideResObj = slideResObj
+    warpObj.digramFileContent = digramFileContent
+    warpObj.diagramResObj = diagramResObj
+    const fill = await getSlideBackgroundFill(warpObj)
+
+    const elements = []
+    for (const nodeKey in nodes) {
+      if (nodes[nodeKey].constructor !== Array) nodes[nodeKey] = [nodes[nodeKey]]
+      for (const node of nodes[nodeKey]) {
+        const ret = await processNodesInSlide(nodeKey, node, nodes, warpObj, 'slide')
+        if (ret) elements.push(ret)
+      }
+    }
+
+    return {
+      fill,
+      elements,
+      layoutElements,
+      note,
+    }
+  }
+
+  async processSlideLayout(sldLayoutFileName) {
+    if (!this._slideLayoutMap) {
+      this._slideLayoutMap = {}
+    }
+
+    if (!(sldLayoutFileName in this._slideLayoutMap)) {
+      const { defaultTextStyle } = await this.getSlideInfo()
+      const content = await this.readXml(sldLayoutFileName)
+      const nodes = indexNodes(content)
+      const slideLayoutResFilename = sldLayoutFileName.replace('slideLayouts/slideLayout', 'slideLayouts/_rels/slideLayout') + '.rels'
+      const relationships = await this.processRelationship(slideLayoutResFilename)
+      const masterFilename = relationships.masterFilename
+      const master = await this.processMaster(masterFilename)
+      const tableStyles = await this.getTableStyles()
+
+      const {themeContent, themeColors} = await this.getTheme()
+      const warpObj = {
+        zip: this.zip,
+        slideLayoutContent: content,
+        slideLayoutTables: nodes,
+        layoutResObj: relationships.resObj,
+        slideMasterContent: master.content,
+        slideMasterTables: master.nodes,
+        masterResObj: master.relationships.resObj,
+        tableStyles,
+        // slideContent,
+        // slideResObj: null,
+        slideMasterTextStyles: master.textStyles,
+        themeContent,
+        themeResObj: master.theme.relationships.resObj,
+        themeColors,
+        defaultTextStyle,
+      }
+
+      const elements = await this.getLayoutElements(warpObj)
+      const fill = await getSlideBackgroundFill(warpObj)
+
+      this._slideLayoutMap[sldLayoutFileName] = {
+        elements,
+        content,
+        nodes,
+        master,
+        relationships,
+        warpObj,
+        fill,
+      }
+    }
+
+    return this._slideLayoutMap[sldLayoutFileName]
+  }
+
+  async processMaster(masterFileName) {
+    if (!this._masterMap) {
+      this._masterMap = {}
+    }
+
+    if (!(masterFileName in this._masterMap)) {
+      const content = await this.readXml(masterFileName)
+      const textStyles = getTextByPathList(content, ['p:sldMaster', 'p:txStyles'])
+      const nodes = indexNodes(content)
+      const slideMasterResFilename = masterFileName.replace('slideMasters/slideMaster', 'slideMasters/_rels/slideMaster') + '.rels'
+      const relationships = await this.processRelationship(slideMasterResFilename)
+      const themeFileName = relationships.themeFilename
+      const theme = await this.processTheme(themeFileName)
+
+      this._masterMap[masterFileName] = {
+        content,
+        nodes,
+        textStyles,
+        theme,
+        relationships,
+      }
+    }
+
+    return this._masterMap[masterFileName]
+  }
+
+  async processTheme(themeFileName) {
+    if (!this._themeMap) {
+      this._themeMap = {}
+    }
+    if (!(themeFileName in this._themeMap)) {
+      const themeName = themeFileName.split('/').pop()
+      const themeResFileName = themeFileName.replace(themeName, '_rels/' + themeName) + '.rels'
+      const relationships = await this.processRelationship(themeResFileName)
+
+      this._themeMap[themeFileName] = {
+        relationships,
+      }
+    }
+
+    return this._themeMap[themeFileName]
+  }
+
+  async processNote(noteFileName) {
+    if (!this._noteMap) {
+      this._noteMap = {}
+    }
+    if (!(noteFileName in this._noteMap)) {
+      const content = await this.readXml(noteFileName)
+      let text = ''
+      let spNodes = getTextByPathList(content, ['p:notes', 'p:cSld', 'p:spTree', 'p:sp'])
+      if (!spNodes) {
+        this._noteMap[noteFileName] = ''
+      }
+      else {
+        if (spNodes.constructor !== Array) spNodes = [spNodes]
+        for (const spNode of spNodes) {
+          let rNodes = getTextByPathList(spNode, ['p:txBody', 'a:p', 'a:r'])
+          if (!rNodes) continue
+
+          if (rNodes.constructor !== Array) rNodes = [rNodes]
+          for (const rNode of rNodes) {
+            const t = getTextByPathList(rNode, ['a:t'])
+            if (t && typeof t === 'string') text += t
+          }
+        }
+        this._noteMap[noteFileName] = text
+      }
+    }
+    return this._noteMap[noteFileName]
+  }
+
+  async processRelationship(relationshipFileName) {
+    const resContent = await this.readXml(relationshipFileName)
+    let relationshipArray = resContent ? resContent['Relationships']['Relationship'] : []
+    if (relationshipArray.constructor !== Array) relationshipArray = [relationshipArray]
+
+    let noteFilename = ''
+    let layoutFilename = ''
+    let diagramFilename = ''
+    let masterFilename = ''
+    let themeFilename = ''
+    const resObj = {}
+
+    for (const relationshipArrayItem of relationshipArray) {
+      switch (relationshipArrayItem['attrs']['Type']) {
+        case 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout':
+          layoutFilename = relationshipArrayItem['attrs']['Target'].replace('../', 'ppt/')
+          break
+        case 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide':
+          noteFilename = relationshipArrayItem['attrs']['Target'].replace('../', 'ppt/')
+          break
+        case 'http://schemas.microsoft.com/office/2007/relationships/diagramDrawing':
+          diagramFilename = relationshipArrayItem['attrs']['Target'].replace('../', 'ppt/')
+          resObj[relationshipArrayItem['attrs']['Id']] = {
+            type: relationshipArrayItem['attrs']['Type'].replace('http://schemas.openxmlformats.org/officeDocument/2006/relationships/', ''),
+            target: relationshipArrayItem['attrs']['Target'].replace('../', 'ppt/')
+          }
+          break
+        case 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster':
+          masterFilename = relationshipArrayItem['attrs']['Target'].replace('../', 'ppt/')
+          break
+        case 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme':
+          themeFilename = relationshipArrayItem['attrs']['Target'].replace('../', 'ppt/')
+          break
+        case 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/image':
+        case 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart':
+        case 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink':
+        default:
+          resObj[relationshipArrayItem['attrs']['Id']] = {
+            type: relationshipArrayItem['attrs']['Type'].replace('http://schemas.openxmlformats.org/officeDocument/2006/relationships/', ''),
+            target: relationshipArrayItem['attrs']['Target'].replace('../', 'ppt/'),
+          }
+      }
+    }
+
+    return {
+      resObj,
+      layoutFilename,
+      noteFilename,
+      diagramFilename,
+      masterFilename,
+      themeFilename,
+    }
+  }
+
+  async getLayoutElements(warpObj) {
+    const elements = []
+    const slideLayoutContent = warpObj.slideLayoutContent
+    const slideMasterContent = warpObj.slideMasterContent
+    const nodesSldLayout = getTextByPathList(slideLayoutContent, ['p:sldLayout', 'p:cSld', 'p:spTree'])
+    const nodesSldMaster = getTextByPathList(slideMasterContent, ['p:sldMaster', 'p:cSld', 'p:spTree'])
+
+    const showMasterSp = getTextByPathList(slideLayoutContent, ['p:sldLayout', 'attrs', 'showMasterSp'])
+
+    // TODO add placeholder support
+
+    if (nodesSldLayout) {
+      for (const nodeKey in nodesSldLayout) {
+        if (nodesSldLayout[nodeKey].constructor === Array) {
+          for (let i = 0; i < nodesSldLayout[nodeKey].length; i++) {
+            const ph = getTextByPathList(nodesSldLayout[nodeKey][i], ['p:nvSpPr', 'p:nvPr', 'p:ph'])
+            if (!ph) {
+              const ret = await this.processNodesInSlide(nodeKey, nodesSldLayout[nodeKey][i], nodesSldLayout, warpObj, 'slideLayoutBg')
+              if (ret) elements.push(ret)
+            }
+          }
+        }
+        else {
+          const ph = getTextByPathList(nodesSldLayout[nodeKey], ['p:nvSpPr', 'p:nvPr', 'p:ph'])
+          if (!ph) {
+            const ret = await this.processNodesInSlide(nodeKey, nodesSldLayout[nodeKey], nodesSldLayout, warpObj, 'slideLayoutBg')
+            if (ret) elements.push(ret)
+          }
+        }
+      }
+    }
+    if (nodesSldMaster && showMasterSp !== '0') {
+      for (const nodeKey in nodesSldMaster) {
+        if (nodesSldMaster[nodeKey].constructor === Array) {
+          for (let i = 0; i < nodesSldMaster[nodeKey].length; i++) {
+            const ph = getTextByPathList(nodesSldMaster[nodeKey][i], ['p:nvSpPr', 'p:nvPr', 'p:ph'])
+            if (!ph) {
+              const ret = await this.processNodesInSlide(nodeKey, nodesSldMaster[nodeKey][i], nodesSldMaster, warpObj, 'slideMasterBg')
+              if (ret) elements.push(ret)
+            }
+          }
+        }
+        else {
+          const ph = getTextByPathList(nodesSldMaster[nodeKey], ['p:nvSpPr', 'p:nvPr', 'p:ph'])
+          if (!ph) {
+            const ret = await this.processNodesInSlide(nodeKey, nodesSldMaster[nodeKey], nodesSldMaster, warpObj, 'slideMasterBg')
+            if (ret) elements.push(ret)
+          }
+        }
+      }
+    }
+    return elements
+  }
+
+  async processNodesInSlide(nodeKey, nodeValue, nodes, obj, source) {
+    let json
+    switch (nodeKey) {
+      case 'p:sp': // Shape, Text
+        json = await processSpNode(nodeValue, nodes, obj, source)
+        break
+      case 'p:cxnSp': // Shape, Text
+        json = await processCxnSpNode(nodeValue, nodes, obj, source)
+        break
+      case 'p:pic': // Image, Video, Audio
+        json = await processPicNode(nodeValue, obj, source)
+        break
+      case 'p:graphicFrame': // Chart, Diagram, Table
+        json = await processGraphicFrameNode(nodeValue, obj, source)
+        break
+      case 'p:grpSp':
+        json = await processGroupSpNode(nodeValue, obj, source)
+        break
+      case 'mc:AlternateContent':
+        if (getTextByPathList(nodeValue, ['mc:Fallback', 'p:grpSpPr', 'a:xfrm'])) {
+          json = await processGroupSpNode(getTextByPathList(nodeValue, ['mc:Fallback']), obj, source)
+        }
+        else if (getTextByPathList(nodeValue, ['mc:Choice'])) {
+          json = await processMathNode(nodeValue, obj, source)
+        }
+        break
+      default:
+    }
+
+    return json
+  }
+
+  async readXml(fileName) {
+    return await readXmlFile(this.zip, fileName)
   }
 }
